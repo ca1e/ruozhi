@@ -6,6 +6,7 @@ mod identity;
 mod ota;
 mod protocol;
 mod state;
+mod tray;
 mod ui;
 
 use config::Mode;
@@ -130,22 +131,47 @@ fn run_app(cfg: config::Config, args: &config::Args, source: audio::Source) -> a
     let mut f = fenster::Fenster::new("ruozhi", W, H, &mut buf);
     let mut orb = ui::Orb::new();
     f.open();
-    log::info!("ready — hold {} to talk, Esc to quit", fenster::talk_key_name());
+    // Menu-bar residency (macOS/Windows): closing the window only hides it,
+    // the tray icon is the way back. Linux has no tray yet and keeps quitting.
+    tray::init(&f);
+    log::info!("ready — hold {} to talk, Esc to hide the window", fenster::talk_key_name());
 
     let mut prev_talk = false;
+    let mut prev_esc = false;
     loop {
         let frame_start = fenster::time();
 
-        // non-zero means the window is gone (WM_QUIT after the user closed
-        // it on Windows); macOS terminates the process inside loop_once.
+        // non-zero means the window is gone (WM_QUIT after the user closed it
+        // on Windows — unreachable now that close hides instead of destroys,
+        // kept as a safety net).
         if f.loop_once() != 0 {
             break;
         }
 
-        if f.key(27) {
+        // tray menu: "打开窗口" is applied inside poll(); true = "关闭程序"
+        if tray::poll() {
             let _ = ui_tx.send(state::UiEvent::Quit);
             break;
         }
+
+        // Esc hides the window into the tray (Linux: still quits).
+        let esc = f.key(27);
+        if esc && !prev_esc {
+            if tray::available() {
+                tray::hide();
+                f.reset_input();
+                // a talk hold must not survive the hide: no KeyUp will arrive
+                if prev_talk {
+                    let _ = ui_tx.send(state::UiEvent::CmdUp);
+                    prev_talk = false;
+                }
+            } else {
+                let _ = ui_tx.send(state::UiEvent::Quit);
+                break;
+            }
+        }
+        prev_esc = esc;
+
         let talk = f.talk_pressed();
         if talk != prev_talk {
             let _ = ui_tx.send(if talk {
@@ -160,24 +186,29 @@ fn run_app(cfg: config::Config, args: &config::Args, source: audio::Source) -> a
         if shared.action() == state::ACTION_RESTART {
             log::info!("reboot requested via MCP — restarting");
             std::thread::sleep(std::time::Duration::from_millis(300));
+            tray::shutdown();
             f.close();
             restart_self();
         }
 
-        orb.draw(
-            &mut buf,
-            shared.phase(),
-            frame_start,
-            shared.mic_level(),
-            shared.level(),
-            shared.emotion(),
-        );
+        // nothing to see while the window is hidden — skip the pixel work
+        if !tray::is_hidden() {
+            orb.draw(
+                &mut buf,
+                shared.phase(),
+                frame_start,
+                shared.mic_level(),
+                shared.level(),
+                shared.emotion(),
+            );
+        }
 
         let wait = 1000 / 60 - (fenster::time() - frame_start);
         if wait > 0 {
             fenster::sleep(wait);
         }
     }
+    tray::shutdown();
     f.close();
     Ok(())
 }

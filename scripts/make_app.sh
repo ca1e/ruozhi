@@ -24,6 +24,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleVersion</key><string>0.1.0</string>
     <key>LSMinimumSystemVersion</key><string>12.0</string>
     <key>CFBundleIconFile</key><string>ruozhi</string>
+    <!-- menu-bar app: no Dock icon, the tray icon is the resident entry -->
+    <key>LSUIElement</key><true/>
     <key>NSMicrophoneUsageDescription</key><string>ruozhi 需要使用麦克风与 小智 进行语音对话</string>
 </dict>
 </plist>

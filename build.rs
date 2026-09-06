@@ -11,13 +11,17 @@ fn main() {
 
     if target.contains("darwin") {
         println!("cargo:rustc-link-lib=framework=Cocoa");
+        // src/tray.rs calls the ObjC runtime directly (status item + close
+        // hook); libobjc comes transitively with Cocoa, be explicit anyway
+        println!("cargo:rustc-link-lib=objc");
     } else if target.contains("linux") {
         println!("cargo:rustc-link-lib=X11");
     } else if target.contains("windows") {
         // fenster's win32 backend: window/input APIs live in user32, the
-        // blit in gdi32
+        // blit in gdi32; src/tray.rs adds the tray icon via shell32
         println!("cargo:rustc-link-lib=user32");
         println!("cargo:rustc-link-lib=gdi32");
+        println!("cargo:rustc-link-lib=shell32");
         embed_windows_resources();
     }
     println!("cargo:rerun-if-changed=c/fenster.c");

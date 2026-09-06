@@ -45,6 +45,12 @@ struct FenRaw {
     x: c_int,
     y: c_int,
     mouse: c_int,
+    // Must mirror `struct fenster` in c/fenster.h exactly: Linux carries four
+    // pointer-sized fields there (Display*, Window, GC, XImage*); the others
+    // carry one.
+    #[cfg(target_os = "linux")]
+    x11: [usize; 4],
+    #[cfg(not(target_os = "linux"))]
     wnd: *mut c_void,
 }
 
@@ -69,6 +75,9 @@ impl Fenster {
             x: 0,
             y: 0,
             mouse: 0,
+            #[cfg(target_os = "linux")]
+            x11: [0; 4],
+            #[cfg(not(target_os = "linux"))]
             wnd: std::ptr::null_mut(),
         };
         Self {
@@ -92,6 +101,27 @@ impl Fenster {
 
     pub fn open(&mut self) -> i32 {
         unsafe { fenster_open(&mut self.raw) }
+    }
+
+    /// Platform window handle (macOS: NSWindow `id`; Windows: HWND; null on
+    /// Linux). Valid after [`Fenster::open`].
+    pub fn window_handle(&self) -> *mut c_void {
+        #[cfg(target_os = "linux")]
+        {
+            std::ptr::null_mut()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.raw.wnd
+        }
+    }
+
+    /// Drops polled input state whose release a hidden window will never see:
+    /// once hidden, no more key events arrive, so a held Esc / modifier would
+    /// otherwise stay latched forever.
+    pub fn reset_input(&mut self) {
+        self.raw.keys[27] = 0; // Esc
+        self.raw.r#mod = 0;
     }
 
     /// Pumps one frame: draws the buffer and processes at most one event.

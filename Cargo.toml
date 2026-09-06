@@ -1,0 +1,31 @@
+[package]
+name = "ruozhi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+cpal = "0.18.2"
+crossbeam-channel = "0.5.16"
+env_logger = "0.11.11"
+http = "1.5.0"
+local-ip-address = "0.6.13"
+log = "0.4.34"
+mac_address = "1.1.8"
+opus = "0.4.0"
+rand = "0.10.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+starship-battery = "0.11.1"
+sysinfo = "0.39.6"
+toml = "1.1.5"
+tungstenite = { version = "0.30.0", features = ["native-tls"] }
+ureq = "2"
+
+[build-dependencies]
+cc = "1.4.5"
+
+[target.'cfg(windows)'.build-dependencies]
+# embeds assets/ruozhi.ico + VERSIONINFO into the exe (rc.exe from the
+# Windows SDK; vendored by winresource's own lookup)
+winresource = "0.1"

@@ -1,0 +1,121 @@
+//! Hand-written FFI bindings for the fenster window library
+//! (vendored at c/fenster.h, compiled by build.rs).
+//!
+//! The raw struct layout must match `struct fenster` in fenster.h. On macOS
+//! the trailing platform field is `id wnd`, i.e. a plain pointer.
+
+use std::ffi::{c_char, c_int, c_void, CString};
+
+/// Modifier bit mask stored in `mod`: ctrl=1, shift=2, alt=4, meta=8.
+/// macOS Command key is meta (Windows: Win, Linux: Super); only macOS's
+/// TALK_MOD aliases it, so the constant itself is mac-only.
+#[cfg(target_os = "macos")]
+pub const MOD_META: c_int = 8;
+#[allow(dead_code)] // used as TALK_MOD on non-mac platforms
+pub const MOD_CTRL: c_int = 1;
+
+/// The hold-to-talk modifier: Command on macOS; Ctrl elsewhere. The meta key
+/// on Windows/Linux is the OS key (Win/Super) — releasing it pops the start
+/// menu / activities overview, so it can't be held to talk.
+#[cfg(target_os = "macos")]
+pub const TALK_MOD: c_int = MOD_META;
+#[cfg(not(target_os = "macos"))]
+pub const TALK_MOD: c_int = MOD_CTRL;
+
+/// Display name of the hold-to-talk key, for logs and hints.
+pub fn talk_key_name() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "Command"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "Ctrl"
+    }
+}
+
+#[repr(C)]
+struct FenRaw {
+    title: *const c_char,
+    width: c_int,
+    height: c_int,
+    buf: *mut u32,
+    keys: [c_int; 256],
+    r#mod: c_int,
+    x: c_int,
+    y: c_int,
+    mouse: c_int,
+    wnd: *mut c_void,
+}
+
+/// Owned handle; `_title` keeps the C string alive as long as the window does.
+pub struct Fenster {
+    raw: FenRaw,
+    _title: CString,
+}
+
+impl Fenster {
+    /// `buf.len()` must equal `width * height`.
+    pub fn new(title: &str, width: i32, height: i32, buf: &mut [u32]) -> Self {
+        debug_assert_eq!(buf.len(), (width * height) as usize);
+        let c_title = CString::new(title).expect("window title contains NUL");
+        let raw = FenRaw {
+            title: c_title.as_ptr(),
+            width,
+            height,
+            buf: buf.as_mut_ptr(),
+            keys: [0; 256],
+            r#mod: 0,
+            x: 0,
+            y: 0,
+            mouse: 0,
+            wnd: std::ptr::null_mut(),
+        };
+        Self {
+            raw,
+            _title: c_title,
+        }
+    }
+
+    pub fn key(&self, code: usize) -> bool {
+        // Key state is polled per frame: 1 = currently held. Indexes are mostly
+        // uppercase ASCII (Esc = 27).
+        self.raw.keys[code.min(255)] != 0
+    }
+
+    /// True while the hold-to-talk key is held ([`TALK_MOD`]: Command on
+    /// macOS — needs the FlagsChanged patch vendored into fenster.h — and
+    /// Ctrl on Windows/Linux, which report plain key events).
+    pub fn talk_pressed(&self) -> bool {
+        self.raw.r#mod & TALK_MOD != 0
+    }
+
+    pub fn open(&mut self) -> i32 {
+        unsafe { fenster_open(&mut self.raw) }
+    }
+
+    /// Pumps one frame: draws the buffer and processes at most one event.
+    pub fn loop_once(&mut self) -> i32 {
+        unsafe { fenster_loop(&mut self.raw) }
+    }
+
+    pub fn close(&mut self) {
+        unsafe { fenster_close(&mut self.raw) }
+    }
+}
+
+pub fn sleep(ms: i64) {
+    unsafe { fenster_sleep(ms) }
+}
+
+pub fn time() -> i64 {
+    unsafe { fenster_time() }
+}
+
+unsafe extern "C" {
+    fn fenster_open(f: *mut FenRaw) -> c_int;
+    fn fenster_loop(f: *mut FenRaw) -> c_int;
+    fn fenster_close(f: *mut FenRaw);
+    fn fenster_sleep(ms: i64);
+    fn fenster_time() -> i64;
+}

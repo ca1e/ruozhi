@@ -1,8 +1,8 @@
-//! Optional, read-only config file (`~/.config/ruozhi/config.toml`, or
-//! `%APPDATA%\ruozhi\config.toml` on Windows):
-//! present -> its values are used; absent -> nothing is ever written and the
-//! defaults apply (hardware-derived identity + OTA-issued credentials).
-//! Create it by hand only to pin a device identity or use a custom server.
+//! Config file (`~/.config/ruozhi/config.toml`, or `%APPDATA%\ruozhi\config.toml`
+//! on Windows): absent -> an all-commented default template is written once
+//! (parsing it yields the same defaults as no file: hardware-derived identity +
+//! OTA-issued credentials); present -> read as-is, never rewritten. Uncomment a
+//! line to pin a device identity or use a custom server.
 
 use crate::identity;
 use anyhow::{Context, Result};
@@ -11,6 +11,27 @@ use std::path::PathBuf;
 
 /// Official xiaozhi websocket endpoint (as handed out by the OTA endpoint).
 pub const DEFAULT_WS_URL: &str = "wss://api.tenclass.net/xiaozhi/v1/";
+
+/// Written on first run: every option commented out, so it parses to the same
+/// all-default Config as a missing file while documenting the full surface.
+const TEMPLATE: &str = r#"# ruozhi 配置文件 —— 首次启动自动生成（全默认值），改动后重启生效。
+# 命令行 --url/--token/--device-id/--client-id 可临时覆盖同名项。
+
+# 日志文件路径（默认：Windows %TEMP%\ruozhi.log，macOS /tmp/ruozhi.log；
+# 环境变量 RUOZHI_LOG_FILE 优先级更高）
+#log_file = ""
+
+# 自建 xiaozhi-esp32-server 时固定（缺省像真机一样从 OTA 自动获取）
+#url = "wss://your-server/xiaozhi/v1/"
+#token = ""
+
+# 设备身份（缺省由本机 MAC 派生，详见 README「配置」一节）
+#device_id = "aa:bb:cc:dd:ee:ff"
+#client_id = "uuid-v4"
+
+# 服务端回声消除（二进制协议 v2，让服务器做 AEC）
+#server_aec = false
+"#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
@@ -51,25 +72,47 @@ impl Config {
         }
     }
 
-    /// Missing or unparsable file simply means "all defaults".
-    pub fn load() -> Self {
+    /// Missing file -> write the default template once (best effort) and use
+    /// defaults; unreadable or unparsable file -> defaults, file untouched.
+    /// Returns the config plus whether the template was just created (main
+    /// surfaces it in the log once the logger is up).
+    pub fn load() -> (Self, bool) {
         let path = Self::path();
         match std::fs::read_to_string(&path) {
             Ok(s) => match toml::from_str(&s) {
                 Ok(c) => {
                     log::info!("config: {}", path.display());
-                    c
+                    (c, false)
                 }
                 Err(e) => {
                     log::warn!("config {} ignored (parse error: {e}); using defaults", path.display());
-                    Self::default()
+                    (Self::default(), false)
                 }
             },
-            Err(_) => {
-                log::info!("no config file at {} — using defaults", path.display());
-                Self::default()
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                log::info!("no config file at {} — writing defaults", path.display());
+                let created = match Self::write_default(&path) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!("cannot write default config: {e}");
+                        false
+                    }
+                };
+                (Self::default(), created)
+            }
+            Err(e) => {
+                log::warn!("config {} unreadable ({e}); using defaults", path.display());
+                (Self::default(), false)
             }
         }
+    }
+
+    /// Drop the first-run template, creating the parent directory if needed.
+    fn write_default(path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, TEMPLATE)
     }
 }
 
@@ -106,10 +149,12 @@ pub struct Args {
     pub token_override: Option<String>,
     pub server_aec: bool,
     pub mode: Mode,
+    /// True when this run just created the first-run config template.
+    pub created_default_config: bool,
 }
 
 pub fn parse() -> Args {
-    let mut config = Config::load();
+    let (mut config, created_default_config) = Config::load();
     let mut mode = Mode::App;
     let mut url_override = None;
     let mut token_override = None;
@@ -144,12 +189,13 @@ pub fn parse() -> Args {
         token_override,
         server_aec,
         mode,
+        created_default_config,
     }
 }
 
 /// Resolve the effective settings: CLI args > config file > defaults
-/// (hardware identity; credentials from OTA; official endpoint). No file is
-/// ever written.
+/// (hardware identity; credentials from OTA; official endpoint). The config
+/// file itself is only ever written as the first-run default template.
 pub fn finalize(config: Config, args: &Args, volume: crate::audio::Volume) -> Result<Connection> {
     // ids: CLI / config file > hardware identity
     let device_id = config

@@ -70,10 +70,11 @@ AI 会自行调用。
 - `device_id` = 本机 MAC 地址（`aa:bb:cc:dd:ee:ff`，对应固件的 Device-Id）
 - `client_id` = MAC 哈希派生的 UUIDv4（对应固件首次生成后永久保存的 uuid）
 
-需要固定成特定设备（比如复刻你手里那块 ESP32 的身份）或对接自建
-`xiaozhi-esp32-server` 时，才**手工**创建配置文件
-（macOS/Linux：`~/.config/ruozhi/config.toml`；Windows：`%APPDATA%\ruozhi\config.toml`；
-也可用 `--device-id` / `--client-id` / `--url` / `--token` 命令行临时覆盖）：
+配置文件（macOS/Linux：`~/.config/ruozhi/config.toml`；Windows：`%APPDATA%\ruozhi\config.toml`）
+首次运行时自动生成：所有项都注释着，即全部使用默认值；想固定成特定设备
+（比如复刻你手里那块 ESP32 的身份）或对接自建 `xiaozhi-esp32-server` 时，
+取消注释并填写即可（也可用 `--device-id` / `--client-id` / `--url` / `--token`
+命令行临时覆盖）：
 
 ```toml
 log_file = "/tmp/ruozhi.log"      # 可选：日志路径（默认随平台，见「日志」一节）
@@ -83,7 +84,7 @@ url      = "ws://your-server/..." # 可选：自建服务器时固定，跳过 O
 token    = "…"                    # 可选
 ```
 
-该文件是纯输入：应用**从不写入或修改**——不存在就不生成，内容坏了会告警并退回默认。
+生成之后应用**只读不写**：内容坏了会告警并退回默认，但不会覆盖或重写文件。
 
 ## 设备绑定
 
@@ -121,7 +122,8 @@ Windows 麦克风隐私是按「桌面应用」整体开关的：说不出声先
 设置 → 隐私和安全性 → 麦克风 →「允许桌面应用访问麦克风」。
 麦克风采集按需开关：按住说话键时任务栏出现麦克风图标，松开后熄灭；
 全局开关关闭时应用照常启动，首次按住会在日志里给出指引。
-双击 exe 会带一个控制台窗口（日志直接可见）；从终端跑则日志进文件。
+双击 exe 是纯 GUI（release 构建无控制台窗口），日志进文件；`cargo run` 等
+debug 构建保留控制台可直接看日志。
 
 ## 麦克风权限（重要，macOS）
 

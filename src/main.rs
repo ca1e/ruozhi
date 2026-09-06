@@ -1,3 +1,9 @@
+// Release builds on Windows use the GUI subsystem so double-clicking the exe
+// doesn't open a console window (debug builds keep one for development). A
+// GUI-subsystem process has no console unless its stdio is redirected, so
+// stdout/stderr writes become silent no-ops — logs live in the log file.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod actions;
 mod audio;
 mod config;
@@ -83,6 +89,9 @@ fn main() {
     let args = config::parse();
     let log_path = init_logger(args.config.log_file.as_deref());
     log::info!("=== ruozhi {} start, log: {} ===", env!("CARGO_PKG_VERSION"), log_path.display());
+    if args.created_default_config {
+        log::info!("first run: default config written to {}", config::Config::path().display());
+    }
     let result = match args.mode {
         Mode::App => run_app(args.config.clone(), &args, audio::Source::Mic),
         Mode::Wav(ref path) => run_app(args.config.clone(), &args, audio::Source::Wav(path.clone())),

@@ -70,8 +70,8 @@ pub fn lock_screen() -> bool {
 mod win {
     use std::ffi::c_void;
 
-    /// ShellExecuteW = the exact "double-click" semantics for URLs, app names
-    /// and documents, without going through a shell string.
+    // ShellExecuteW = the exact "double-click" semantics for URLs, app names
+    // and documents, without going through a shell string.
     #[link(name = "shell32")]
     unsafe extern "system" {
         pub fn ShellExecuteW(
@@ -84,7 +84,7 @@ mod win {
         ) -> usize;
     }
 
-    /// LockWorkStation (user32, already linked by build.rs).
+    // LockWorkStation (user32, already linked by build.rs).
     #[link(name = "user32")]
     unsafe extern "system" {
         pub fn LockWorkStation() -> i32;

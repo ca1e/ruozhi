@@ -32,5 +32,5 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 codesign --force --sign - "$APP" 2>/dev/null || true
 echo "built $APP"
-echo "run:  open $APP          (GUI, 首次运行会弹出麦克风授权)"
+echo "run:  open $APP          (GUI，首次按住说话键时弹出麦克风授权)"
 echo "或者: $APP/Contents/MacOS/ruozhi   (终端里跑，日志可见)"

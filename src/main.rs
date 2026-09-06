@@ -1,3 +1,4 @@
+mod actions;
 mod audio;
 mod config;
 mod fenster;
@@ -6,6 +7,7 @@ mod identity;
 mod ota;
 mod protocol;
 mod state;
+mod talk;
 mod tray;
 mod ui;
 
@@ -138,6 +140,10 @@ fn run_app(cfg: config::Config, args: &config::Args, source: audio::Source) -> a
 
     let mut prev_talk = false;
     let mut prev_esc = false;
+    // MCP self.exit bookkeeping: when the request was seen, and when the
+    // phase last settled into Idle
+    let mut quit_seen: Option<std::time::Instant> = None;
+    let mut idle_since: Option<std::time::Instant> = None;
     loop {
         let frame_start = fenster::time();
 
@@ -160,11 +166,9 @@ fn run_app(cfg: config::Config, args: &config::Args, source: audio::Source) -> a
             if tray::available() {
                 tray::hide();
                 f.reset_input();
-                // a talk hold must not survive the hide: no KeyUp will arrive
-                if prev_talk {
-                    let _ = ui_tx.send(state::UiEvent::CmdUp);
-                    prev_talk = false;
-                }
+                // no forced CmdUp on hide: the talk key below is read from
+                // the global keyboard state, so a held key simply keeps
+                // talking while the window is hidden
             } else {
                 let _ = ui_tx.send(state::UiEvent::Quit);
                 break;
@@ -172,7 +176,14 @@ fn run_app(cfg: config::Config, args: &config::Args, source: audio::Source) -> a
         }
         prev_esc = esc;
 
-        let talk = f.talk_pressed();
+        // talk key: OS-global keyboard state so holding works while the
+        // window is hidden or another app is focused (fenster events only
+        // arrive with focus; Linux without X11 falls back to window events)
+        let talk = if talk::available() {
+            talk::pressed()
+        } else {
+            f.talk_pressed()
+        };
         if talk != prev_talk {
             let _ = ui_tx.send(if talk {
                 state::UiEvent::CmdDown
@@ -189,6 +200,26 @@ fn run_app(cfg: config::Config, args: &config::Args, source: audio::Source) -> a
             tray::shutdown();
             f.close();
             restart_self();
+        }
+
+        // MCP self.exit: quit after the goodbye reply finishes. The turn ends
+        // in Idle; require a short stable-idle window so a reply that starts
+        // right after the tool call still plays out, capped at 30 s for turns
+        // that never speak.
+        if shared.action() == state::ACTION_QUIT {
+            let t0 = *quit_seen.get_or_insert_with(std::time::Instant::now);
+            if shared.phase() != Phase::Idle {
+                idle_since = None;
+            } else {
+                let since = *idle_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() > std::time::Duration::from_secs(2)
+                    || t0.elapsed() > std::time::Duration::from_secs(30)
+                {
+                    log::info!("exit requested via MCP — quitting");
+                    let _ = ui_tx.send(state::UiEvent::Quit);
+                    break;
+                }
+            }
         }
 
         // nothing to see while the window is hidden — skip the pixel work
@@ -210,6 +241,7 @@ fn run_app(cfg: config::Config, args: &config::Args, source: audio::Source) -> a
     }
     tray::shutdown();
     f.close();
+    talk::shutdown();
     Ok(())
 }
 
@@ -223,6 +255,9 @@ fn run_loopback() -> anyhow::Result<()> {
         audio::Source::Mic,
         Arc::new(std::sync::atomic::AtomicU32::new(audio::DEFAULT_VOLUME)),
     )?;
+    // loopback is an explicit mic self-test: open capture right away (the OS
+    // mic permission prompt appearing here is expected), no talk button.
+    handles.ensure_capture();
     shared.set_mic_enabled(true);
 
     // route encoded packets straight into the playback queue

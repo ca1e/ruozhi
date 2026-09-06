@@ -95,6 +95,11 @@ impl Fenster {
     /// True while the hold-to-talk key is held ([`TALK_MOD`]: Command on
     /// macOS — needs the FlagsChanged patch vendored into fenster.h — and
     /// Ctrl on Windows/Linux, which report plain key events).
+    ///
+    /// Fallback only: the main loop reads the OS-global key state
+    /// (`talk::pressed`) so the key also works while the window is hidden
+    /// or unfocused; this window-event path is used when no global source
+    /// exists (Linux without X11).
     pub fn talk_pressed(&self) -> bool {
         self.raw.r#mod & TALK_MOD != 0
     }

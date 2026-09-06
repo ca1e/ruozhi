@@ -1,8 +1,12 @@
 //! Audio I/O.
 //!
-//! Capture: cpal input stream (device rate, N ch) -> mono downmix -> ring ->
-//! worker: resample to 16 kHz -> 60 ms opus frames -> `encoded_rx` for the
-//! network thread.
+//! Capture (on-demand): cpal input stream (device rate, N ch) -> mono
+//! downmix -> ring -> worker: resample to 16 kHz -> 60 ms opus frames ->
+//! `encoded_rx` for the network thread. The input device is opened only when
+//! the user actually talks ([`AudioHandles::ensure_capture`]) and closed
+//! again when the turn ends ([`AudioHandles::stop_capture`]) — the deferral
+//! is also what makes macOS show its mic-permission prompt at first use
+//! instead of at app startup.
 //!
 //! Playback: network thread pushes opus packets into [`JitterBuf`] -> worker:
 //! decode (server sample rate) -> resample to device rate -> ring -> cpal
@@ -15,7 +19,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use opus::{Application, Bitrate, Channels, Decoder, Encoder};
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -358,7 +362,7 @@ fn rms(samples: &[f32]) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// Startup
+// Capture lifecycle & startup
 // ---------------------------------------------------------------------------
 
 pub struct AudioHandles {
@@ -371,7 +375,32 @@ pub struct AudioHandles {
     play_ring: MonoRing,
     /// Output device sample rate, for turning backlog into milliseconds.
     pub out_rate: u32,
+    /// Live output streams, held so playback keeps running.
     _streams: Vec<cpal::Stream>,
+    /// Capture path state: opened lazily by [`Self::ensure_capture`], closed
+    /// by [`Self::stop_capture`].
+    capture: Mutex<CaptureSetup>,
+}
+
+/// Deferred capture state owned by [`AudioHandles`].
+struct CaptureSetup {
+    source: Source,
+    shared: Arc<SharedState>,
+    encoded_tx: Sender<Vec<u8>>,
+    /// `Some` while capture is live (input stream + encode worker, or the
+    /// wav pacer).
+    runtime: Option<CaptureRuntime>,
+    /// Whether a capture has run before: the first open logs at info, later
+    /// start/stop cycles at debug to keep per-turn logs quiet.
+    ever_started: bool,
+}
+
+/// A running capture: the cpal input streams plus the workers' exit flag.
+/// Dropping it stops the device.
+struct CaptureRuntime {
+    /// Held so the input streams keep running (never read).
+    _streams: Vec<cpal::Stream>,
+    stop: Arc<AtomicBool>,
 }
 
 /// Per-platform heads-up about where the mic permission lives, logged once
@@ -440,6 +469,71 @@ impl AudioHandles {
     pub fn playback_backlog(&self) -> usize {
         self.play_ring.level()
     }
+
+    /// Open the capture path (mic input stream + encode worker, or the
+    /// `--wav` pacer). Idempotent while capture is running; a failed start
+    /// is retried on the next call.
+    ///
+    /// Deliberately called only when the user actually talks: opening the
+    /// input device is what triggers macOS's TCC microphone prompt, so it
+    /// appears on the first talk press rather than at app startup. Windows
+    /// gates desktop apps through a global privacy toggle and Linux has no
+    /// gate — there the deferral just keeps the device closed while idle.
+    /// Reopening also re-reads the default device, so switching input
+    /// devices between turns takes effect on the next turn.
+    pub fn ensure_capture(&self) {
+        let mut cap = self.capture.lock().unwrap();
+        if cap.runtime.is_some() {
+            return;
+        }
+        let first = !cap.ever_started;
+        // A just-closed device can be briefly busy (ALSA hw devices after a
+        // quick release -> press); a few short retries smooth that over.
+        let mut started = None;
+        for attempt in 0..3 {
+            match start_capture(&cap.source, &cap.shared, &cap.encoded_tx, first) {
+                Ok(rt) => {
+                    started = Some(rt);
+                    break;
+                }
+                Err(e) if attempt + 1 < 3 => {
+                    log::debug!("capture start failed (attempt {}): {e:#}", attempt + 1);
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => {
+                    // leave un-started: the next talk press retries (the
+                    // device may come back, the user may plug a mic in)
+                    log::error!("could not start capture: {e:#} — will retry on the next talk press");
+                }
+            }
+        }
+        if let Some(rt) = started {
+            cap.ever_started = true;
+            cap.runtime = Some(rt);
+            if first {
+                log::info!("capture started");
+            } else {
+                log::debug!("capture restarted");
+            }
+        }
+    }
+
+    /// Close the capture path opened by [`Self::ensure_capture`]. The workers
+    /// exit on their next tick; mic level is zeroed so the orb does not freeze
+    /// on a stale value. A no-op for the `--wav` source (no device or mic
+    /// indicator to release; its pacer is already gated by `mic_enabled`).
+    pub fn stop_capture(&self) {
+        let mut cap = self.capture.lock().unwrap();
+        if matches!(cap.source, Source::Wav(_)) {
+            return;
+        }
+        if let Some(rt) = cap.runtime.take() {
+            rt.stop.store(true, Ordering::Relaxed);
+            cap.shared.set_mic_level(0.0);
+            drop(rt); // dropping the streams stops the input device
+            log::debug!("capture stopped");
+        }
+    }
 }
 
 pub fn spawn(shared: Arc<SharedState>, source: Source, volume: Volume) -> Result<AudioHandles> {
@@ -447,188 +541,6 @@ pub fn spawn(shared: Arc<SharedState>, source: Source, volume: Volume) -> Result
     let jitter = Arc::new(JitterBuf::new());
     let decode_rate = Arc::new(AtomicU32::new(DEFAULT_PLAY_RATE));
     let mut streams = Vec::new();
-
-    // ----- capture -----
-    let (in_rate, cap_ring) = match &source {
-        Source::Mic => {
-            let in_dev = cpal::default_host().default_input_device().context("no default input device")?;
-            match in_dev.description() {
-                Ok(desc) => log::info!("input device: {} ({:?})", desc.name(), desc.device_type()),
-                Err(e) => log::debug!("input device description unavailable: {e}"),
-            }
-            // Where does mic permission live on this OS? Silent capture
-            // failure is the #1 "it only says 嗯" bug; each OS attributes
-            // the permission differently (see below).
-            log_mic_permission_hint();
-            let in_cfg = in_dev
-                .default_input_config()
-                .context("no default input config")?;
-            let in_rate = in_cfg.sample_rate();
-            let in_ch = in_cfg.channels() as usize;
-            log::info!("input: {} Hz x {} ch ({:?})", in_rate, in_ch, in_cfg.sample_format());
-
-            let ring = MonoRing::new(in_rate as usize); // ~1 s
-            let stream = match in_cfg.sample_format() {
-                cpal::SampleFormat::F32 => {
-                    let r = ring.clone();
-                    let err = move |e| log::warn!("input stream error: {e}");
-                    in_dev.build_input_stream(
-                        in_cfg.clone().into(),
-                        move |d: &[f32], _| {
-                            for frame in d.chunks(in_ch) {
-                                r.push(frame.iter().sum::<f32>() / in_ch as f32);
-                            }
-                        },
-                        err,
-                        None,
-                    )?
-                }
-                cpal::SampleFormat::I16 => {
-                    let r = ring.clone();
-                    let err = move |e| log::warn!("input stream error: {e}");
-                    in_dev.build_input_stream(
-                        in_cfg.clone().into(),
-                        move |d: &[i16], _| {
-                            for frame in d.chunks(in_ch) {
-                                let s = frame.iter().map(|&v| v as i32).sum::<i32>() as f32
-                                    / in_ch as f32
-                                    / 32768.0;
-                                r.push(s);
-                            }
-                        },
-                        err,
-                        None,
-                    )?
-                }
-                sf => bail!("unsupported input sample format: {sf:?}"),
-            };
-            stream.play()?;
-            streams.push(stream);
-            (in_rate, ring)
-        }
-        Source::Wav(path) => {
-            let (samples, rate) = parse_wav(path)?;
-            log::info!("input: wav file {} ({} Hz, {} samples)", path.display(), rate, samples.len());
-            let ring = MonoRing::new(rate as usize * 2);
-            let r = ring.clone();
-            let wav_gate = shared.clone();
-            // real-time pacer: waits for mic_enabled (the talk button), then
-            // streams the file into the capture ring at native rate
-            std::thread::Builder::new()
-                .name("wav-source".into())
-                .spawn(move || {
-                    let chunk = (rate as usize / 50).max(1); // 20 ms
-                    let mut pos = 0;
-                    loop {
-                        if !wav_gate.mic_enabled() {
-                            std::thread::sleep(Duration::from_millis(20));
-                            continue;
-                        }
-                        let end = (pos + chunk).min(samples.len());
-                        for &v in &samples[pos..end] {
-                            r.push(v as f32 / 32768.0);
-                        }
-                        pos = end;
-                        if pos >= samples.len() {
-                            // file finished: keep feeding silence like an idle mic
-                            for _ in 0..chunk {
-                                r.push(0.0);
-                            }
-                        }
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                })?;
-            (rate, ring)
-        }
-    };
-
-    // capture worker: ring -> 16 kHz -> opus frames
-    {
-        let shared = shared.clone();
-        let encoded_tx = encoded_tx.clone();
-        std::thread::Builder::new()
-            .name("mic-encode".into())
-            .spawn(move || {
-                let mut enc = match Encoder::new(MIC_RATE, Channels::Mono, Application::Audio) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        log::error!("opus encoder init failed: {e}");
-                        return;
-                    }
-                };
-                let _ = enc.set_bitrate(Bitrate::Bits(32_000));
-                let _ = enc.set_vbr(true);
-                let _ = enc.set_complexity(8);
-                let _ = enc.set_dtx(false);
-
-                let mut rs = Resampler::new(in_rate, MIC_RATE);
-                let mut agc = MicAgc::new();
-                let mut raw = Vec::new();
-                let mut resampled = Vec::new();
-                let mut accum: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES * 2);
-                let mut pkt = [0u8; 4000];
-                // silence watchdog: if a whole talk turn (~3 s wall clock)
-                // never rises above noise, the device has no signal
-                let mut turn_start: Option<Instant> = None;
-                let mut turn_max: f32 = 0.0;
-                let mut silence_warned = false;
-                loop {
-                    std::thread::sleep(Duration::from_millis(5));
-                    raw.clear();
-                    cap_ring.drain(&mut raw);
-                    if raw.is_empty() {
-                        if !shared.mic_enabled() {
-                            accum.clear();
-                        }
-                        continue;
-                    }
-                    resampled.clear();
-                    rs.process(&raw, &mut resampled);
-                    agc.process(&mut resampled);
-                    let level = rms(&resampled);
-                    shared.set_mic_level(level);
-                    if shared.mic_enabled() {
-                        let ts = *turn_start.get_or_insert_with(Instant::now);
-                        turn_max = turn_max.max(level);
-                        if ts.elapsed() >= Duration::from_secs(3)
-                            && turn_max < 0.002
-                            && !silence_warned
-                        {
-                            silence_warned = true;
-                            log::warn!(
-                                "talk button held for 3s but input max level is {:.5} — no signal. {}",
-                                turn_max,
-                                silent_input_hint()
-                            );
-                        }
-                    } else {
-                        turn_start = None;
-                        turn_max = 0.0;
-                        silence_warned = false;
-                    }
-                    for &s in &resampled {
-                        accum.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
-                    }
-                    while accum.len() >= FRAME_SAMPLES {
-                        let frame: Vec<i16> = accum.drain(..FRAME_SAMPLES).collect();
-                        if !shared.mic_enabled() {
-                            continue;
-                        }
-                        match enc.encode(&frame, &mut pkt) {
-                            Ok(n) => {
-                                if encoded_tx.try_send(pkt[..n].to_vec()).is_err() {
-                                    log::debug!("encoded channel full, dropping frame");
-                                }
-                            }
-                            Err(e) => log::warn!("opus encode failed: {e}"),
-                        }
-                    }
-                    if !shared.mic_enabled() {
-                        accum.clear();
-                    }
-                }
-            })?;
-    }
 
     // ----- playback -----
     let out_dev = cpal::default_host().default_output_device().context("no default output device")?;
@@ -725,14 +637,239 @@ pub fn spawn(shared: Arc<SharedState>, source: Source, volume: Volume) -> Result
             })?;
     }
 
-    Ok(AudioHandles {
+    // `--wav` injection needs no mic permission — start it right away so
+    // that mode behaves exactly as before. The real microphone waits for
+    // the first talk press (macOS shows its permission prompt then).
+    let wav_eager = matches!(source, Source::Wav(_));
+    let handles = AudioHandles {
         encoded_rx,
         jitter,
         decode_rate,
         play_ring: play_ring.clone(),
         out_rate,
         _streams: streams,
-    })
+        capture: Mutex::new(CaptureSetup {
+            source,
+            shared,
+            encoded_tx,
+            runtime: None,
+            ever_started: false,
+        }),
+    };
+    if wav_eager {
+        handles.ensure_capture();
+    }
+    Ok(handles)
+}
+
+/// Build and start one capture run: input device stream + encode worker
+/// (real mic) or the wav pacer + encode worker. `first` selects the chattier
+/// first-time log level (device lines and the mic-permission hint).
+fn start_capture(
+    source: &Source,
+    shared: &Arc<SharedState>,
+    encoded_tx: &Sender<Vec<u8>>,
+    first: bool,
+) -> Result<CaptureRuntime> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (in_rate, cap_ring, streams) = match source {
+        Source::Mic => {
+            let in_dev = cpal::default_host().default_input_device().context("no default input device")?;
+            match in_dev.description() {
+                Ok(desc) => log::debug!("input device: {} ({:?})", desc.name(), desc.device_type()),
+                Err(e) => log::debug!("input device description unavailable: {e}"),
+            }
+            // Where does mic permission live on this OS? Silent capture
+            // failure is the #1 "it only says 嗯" bug; each OS attributes
+            // the permission differently (see below). Logged on the first
+            // open only — the answer does not change between turns.
+            if first {
+                log_mic_permission_hint();
+            }
+            let in_cfg = in_dev
+                .default_input_config()
+                .context("no default input config")?;
+            let in_rate = in_cfg.sample_rate();
+            let in_ch = in_cfg.channels() as usize;
+            log::log!(
+                if first { log::Level::Info } else { log::Level::Debug },
+                "input: {} Hz x {} ch ({:?})",
+                in_rate,
+                in_ch,
+                in_cfg.sample_format()
+            );
+
+            let ring = MonoRing::new(in_rate as usize); // ~1 s
+            let stream = match in_cfg.sample_format() {
+                cpal::SampleFormat::F32 => {
+                    let r = ring.clone();
+                    let err = move |e| log::warn!("input stream error: {e}");
+                    in_dev.build_input_stream(
+                        in_cfg.clone().into(),
+                        move |d: &[f32], _| {
+                            for frame in d.chunks(in_ch) {
+                                r.push(frame.iter().sum::<f32>() / in_ch as f32);
+                            }
+                        },
+                        err,
+                        None,
+                    )?
+                }
+                cpal::SampleFormat::I16 => {
+                    let r = ring.clone();
+                    let err = move |e| log::warn!("input stream error: {e}");
+                    in_dev.build_input_stream(
+                        in_cfg.clone().into(),
+                        move |d: &[i16], _| {
+                            for frame in d.chunks(in_ch) {
+                                let s = frame.iter().map(|&v| v as i32).sum::<i32>() as f32
+                                    / in_ch as f32
+                                    / 32768.0;
+                                r.push(s);
+                            }
+                        },
+                        err,
+                        None,
+                    )?
+                }
+                sf => bail!("unsupported input sample format: {sf:?}"),
+            };
+            stream.play()?;
+            (in_rate, ring, vec![stream])
+        }
+        Source::Wav(path) => {
+            let (samples, rate) = parse_wav(path)?;
+            log::info!("input: wav file {} ({} Hz, {} samples)", path.display(), rate, samples.len());
+            let ring = MonoRing::new(rate as usize * 2);
+            let r = ring.clone();
+            let wav_gate = shared.clone();
+            let stop = stop.clone();
+            // real-time pacer: waits for mic_enabled (the talk button), then
+            // streams the file into the capture ring at native rate
+            std::thread::Builder::new()
+                .name("wav-source".into())
+                .spawn(move || {
+                    let chunk = (rate as usize / 50).max(1); // 20 ms
+                    let mut pos = 0;
+                    loop {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        if !wav_gate.mic_enabled() {
+                            std::thread::sleep(Duration::from_millis(20));
+                            continue;
+                        }
+                        let end = (pos + chunk).min(samples.len());
+                        for &v in &samples[pos..end] {
+                            r.push(v as f32 / 32768.0);
+                        }
+                        pos = end;
+                        if pos >= samples.len() {
+                            // file finished: keep feeding silence like an idle mic
+                            for _ in 0..chunk {
+                                r.push(0.0);
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                })?;
+            (rate, ring, Vec::new())
+        }
+    };
+
+    // capture worker: ring -> 16 kHz -> opus frames
+    {
+        let shared = shared.clone();
+        let encoded_tx = encoded_tx.clone();
+        let stop = stop.clone();
+        std::thread::Builder::new()
+            .name("mic-encode".into())
+            .spawn(move || {
+                let mut enc = match Encoder::new(MIC_RATE, Channels::Mono, Application::Audio) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        log::error!("opus encoder init failed: {e}");
+                        return;
+                    }
+                };
+                let _ = enc.set_bitrate(Bitrate::Bits(32_000));
+                let _ = enc.set_vbr(true);
+                let _ = enc.set_complexity(8);
+                let _ = enc.set_dtx(false);
+
+                let mut rs = Resampler::new(in_rate, MIC_RATE);
+                let mut agc = MicAgc::new();
+                let mut raw = Vec::new();
+                let mut resampled = Vec::new();
+                let mut accum: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES * 2);
+                let mut pkt = [0u8; 4000];
+                // silence watchdog: if a whole talk turn (~3 s wall clock)
+                // never rises above noise, the device has no signal
+                let mut turn_start: Option<Instant> = None;
+                let mut turn_max: f32 = 0.0;
+                let mut silence_warned = false;
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                    raw.clear();
+                    cap_ring.drain(&mut raw);
+                    if raw.is_empty() {
+                        if !shared.mic_enabled() {
+                            accum.clear();
+                        }
+                        continue;
+                    }
+                    resampled.clear();
+                    rs.process(&raw, &mut resampled);
+                    agc.process(&mut resampled);
+                    let level = rms(&resampled);
+                    shared.set_mic_level(level);
+                    if shared.mic_enabled() {
+                        let ts = *turn_start.get_or_insert_with(Instant::now);
+                        turn_max = turn_max.max(level);
+                        if ts.elapsed() >= Duration::from_secs(3)
+                            && turn_max < 0.002
+                            && !silence_warned
+                        {
+                            silence_warned = true;
+                            log::warn!(
+                                "talk button held for 3s but input max level is {:.5} — no signal. {}",
+                                turn_max,
+                                silent_input_hint()
+                            );
+                        }
+                    } else {
+                        turn_start = None;
+                        turn_max = 0.0;
+                        silence_warned = false;
+                    }
+                    for &s in &resampled {
+                        accum.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
+                    }
+                    while accum.len() >= FRAME_SAMPLES {
+                        let frame: Vec<i16> = accum.drain(..FRAME_SAMPLES).collect();
+                        if !shared.mic_enabled() {
+                            continue;
+                        }
+                        match enc.encode(&frame, &mut pkt) {
+                            Ok(n) => {
+                                if encoded_tx.try_send(pkt[..n].to_vec()).is_err() {
+                                    log::debug!("encoded channel full, dropping frame");
+                                }
+                            }
+                            Err(e) => log::warn!("opus encode failed: {e}"),
+                        }
+                    }
+                    if !shared.mic_enabled() {
+                        accum.clear();
+                    }
+                }
+            })?;
+    }
+
+    Ok(CaptureRuntime { _streams: streams, stop })
 }
 
 // ---------------------------------------------------------------------------

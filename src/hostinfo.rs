@@ -30,7 +30,7 @@ fn collect() -> String {
         .first()
         .map(|c| c.brand().trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".into());
+        .unwrap_or("unknown".into());
     let cpu = format!(
         "{} ({} cores / {} threads)",
         cpu_brand,
@@ -186,363 +186,180 @@ pub fn local_ip() -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Screen brightness
-//
-// Every platform gets real get/set, hiding behind get_brightness() (0..=1,
-// None when unavailable) and set_brightness(0..=1) -> bool.
-//
-// macOS: on Apple-Silicon the internal panel is driven by DCP; the classic
-//   IOKit IODisplayConnect path enumerates nothing there. The working
-//   interface is CoreDisplay's user-brightness pair (same approach as Lunar
-//   and friends), resolved with dlopen so a future macOS removal degrades
-//   gracefully.
-// Windows: two complementary paths, tried in turn — DDC/CI (dxva2.dll) drives
-//   external desktop monitors over the video cable, WMI
-//   (WmiMonitorBrightness, via PowerShell) drives laptop panels that don't
-//   speak DDC/CI.
-// Linux/BSD: /sys/class/backlight — reads are world-readable, writes need
-//   video-group/root permission, so setting falls back to a gdbus call on
-//   GNOME's power daemon (KDE/Unity expose the same interface).
+// System load / storage / network for the MCP query tools
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "macos")]
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {
-    fn CGGetActiveDisplayList(
-        max: u32,
-        displays: *mut u32,
-        count: *mut u32,
-    ) -> i32;
+fn gib(b: u64) -> f64 {
+    (b as f64 / 1024.0 / 1024.0 / 1024.0 * 10.0).round() / 10.0
 }
 
-#[cfg(target_os = "macos")]
-type GetUserBrightness = unsafe extern "C" fn(u32) -> f64;
-#[cfg(target_os = "macos")]
-type SetUserBrightness = unsafe extern "C" fn(u32, f64);
+/// Overall CPU/memory usage plus the top CPU-consuming processes, as JSON.
+/// CPU numbers need two refreshes a beat apart, so a call costs ~250 ms.
+pub fn top_processes() -> serde_json::Value {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    sys.refresh_cpu_usage();
+    sys.refresh_memory();
+    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    sys.refresh_cpu_usage();
+    sys.refresh_memory();
 
-#[cfg(target_os = "macos")]
-fn core_display_symbols() -> Option<(GetUserBrightness, SetUserBrightness)> {
-    use std::ffi::CString;
-    unsafe extern "C" {
-        fn dlopen(path: *const std::ffi::c_char, mode: i32) -> *mut std::ffi::c_void;
-        fn dlsym(handle: *mut std::ffi::c_void, name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
-    }
-    let path = CString::new("/System/Library/Frameworks/CoreDisplay.framework/CoreDisplay").ok()?;
-    let lib = unsafe { dlopen(path.as_ptr(), 1) }; // RTLD_LAZY
-    if lib.is_null() {
-        return None;
-    }
-    let sym = |name: &str| -> Option<*mut std::ffi::c_void> {
-        let c = CString::new(name).ok()?;
-        let p = unsafe { dlsym(lib, c.as_ptr()) };
-        (!p.is_null()).then_some(p)
-    };
-    let get = unsafe { std::mem::transmute::<*mut std::ffi::c_void, GetUserBrightness>(sym("CoreDisplay_Display_GetUserBrightness")?) };
-    let set = unsafe { std::mem::transmute::<*mut std::ffi::c_void, SetUserBrightness>(sym("CoreDisplay_Display_SetUserBrightness")?) };
-    Some((get, set))
-}
+    let mut procs: Vec<_> = sys
+        .processes()
+        .values()
+        .map(|p| (p.name().to_string_lossy().into_owned(), p.cpu_usage(), p.memory()))
+        .collect();
+    procs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let top = procs
+        .into_iter()
+        .filter(|(_, cpu, _)| *cpu > 0.05)
+        .take(5)
+        .map(|(name, cpu, mem)| {
+            serde_json::json!({
+                "name": name,
+                "cpu": (cpu * 10.0).round() / 10.0,
+                "mem_mb": mem / (1024 * 1024),
+            })
+        })
+        .collect::<Vec<_>>();
 
-#[cfg(target_os = "macos")]
-fn primary_display() -> Option<u32> {
-    let mut id = 0u32;
-    let mut count = 0u32;
-    let rc = unsafe { CGGetActiveDisplayList(1, &mut id, &mut count) };
-    (rc == 0 && count > 0).then_some(id)
-}
-
-/// Current user brightness of the main display, 0..=1.
-#[cfg(target_os = "macos")]
-pub fn get_brightness() -> Option<f32> {
-    let Some((get, _)) = core_display_symbols() else {
-        return None;
-    };
-    let Some(id) = primary_display() else {
-        return None;
-    };
-    let v = unsafe { get(id) };
-    if (0.0..=1.5).contains(&v) {
-        Some(v.clamp(0.0, 1.0) as f32)
-    } else {
-        None
-    }
-}
-
-/// Set user brightness of the main display, 0..=1. Returns success.
-#[cfg(target_os = "macos")]
-pub fn set_brightness(v: f32) -> bool {
-    let Some((_, set)) = core_display_symbols() else {
-        return false;
-    };
-    let Some(id) = primary_display() else {
-        return false;
-    };
-    unsafe { set(id, v.clamp(0.05, 1.0) as f64) };
-    true
-}
-
-// ---- Windows: DDC/CI (external monitors) + WMI (laptop panels) ----
-
-#[cfg(windows)]
-use std::ffi::c_void;
-
-#[cfg(windows)]
-const MONITOR_DEFAULTTOPRIMARY: u32 = 1;
-
-#[cfg(windows)]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct WinPoint {
-    x: i32,
-    y: i32,
-}
-
-/// PHYSICAL_MONITOR from dxva2.h: handle + 128-WCHAR description.
-#[cfg(windows)]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct WinPhysicalMonitor {
-    handle: *mut c_void,
-    description: [u16; 128],
-}
-
-#[cfg(windows)]
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn MonitorFromPoint(pt: WinPoint, flags: u32) -> *mut c_void;
-}
-
-// raw-dylib binds straight to dxva2.dll at link time — no import library
-// needed, so the MSVC toolchain alone is enough.
-#[cfg(windows)]
-#[link(name = "dxva2", kind = "raw-dylib")]
-unsafe extern "system" {
-    fn GetNumberOfPhysicalMonitorsFromHMONITOR(
-        hmonitor: *mut c_void,
-        count: *mut u32,
-    ) -> i32;
-    fn GetPhysicalMonitorsFromHMONITOR(
-        hmonitor: *mut c_void,
-        size: u32,
-        monitors: *mut WinPhysicalMonitor,
-    ) -> i32;
-    fn GetMonitorBrightness(
-        handle: *mut c_void,
-        min: *mut u32,
-        cur: *mut u32,
-        max: *mut u32,
-    ) -> i32;
-    fn SetMonitorBrightness(handle: *mut c_void, value: u32) -> i32;
-    fn DestroyPhysicalMonitors(count: u32, monitors: *mut WinPhysicalMonitor) -> i32;
-}
-
-/// Run `f` on the first physical monitor behind the primary display, with the
-/// enumerate/destroy bookkeeping handled. False when there is nothing to
-/// drive (virtual display, RDP session) or the API reports failure.
-#[cfg(windows)]
-fn win_with_physical_monitor(f: impl FnOnce(*mut c_void) -> bool) -> bool {
-    unsafe {
-        let hmon = MonitorFromPoint(WinPoint { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
-        if hmon.is_null() {
-            return false;
-        }
-        let mut count = 0u32;
-        if GetNumberOfPhysicalMonitorsFromHMONITOR(hmon, &mut count) == 0 || count == 0 {
-            return false;
-        }
-        let mut monitors = vec![
-            WinPhysicalMonitor {
-                handle: std::ptr::null_mut(),
-                description: [0; 128],
-            };
-            count as usize
-        ];
-        let mut ok = false;
-        if GetPhysicalMonitorsFromHMONITOR(hmon, count, monitors.as_mut_ptr()) != 0 {
-            ok = f(monitors[0].handle);
-            DestroyPhysicalMonitors(count, monitors.as_mut_ptr());
-        }
-        ok
-    }
-}
-
-/// DDC/CI brightness of the primary monitor, 0..=1.
-#[cfg(windows)]
-fn win_ddc_get() -> Option<f32> {
-    let mut out = None;
-    win_with_physical_monitor(|h| unsafe {
-        let (mut min, mut cur, mut max) = (0u32, 0u32, 0u32);
-        if GetMonitorBrightness(h, &mut min, &mut cur, &mut max) == 0 || max <= min {
-            return false;
-        }
-        out = Some((cur - min) as f32 / (max - min) as f32);
-        true
-    });
-    out
-}
-
-#[cfg(windows)]
-fn win_ddc_set(v: f32) -> bool {
-    win_with_physical_monitor(|h| unsafe {
-        let (mut min, mut cur, mut max) = (0u32, 0u32, 0u32);
-        if GetMonitorBrightness(h, &mut min, &mut cur, &mut max) == 0 || max <= min {
-            return false;
-        }
-        let value = min + (v.clamp(0.0, 1.0) * (max - min) as f32).round() as u32;
-        SetMonitorBrightness(h, value.min(max)) != 0
+    serde_json::json!({
+        "cpu_percent": (sys.global_cpu_usage() * 10.0).round() / 10.0,
+        "memory_used_gb": gib(sys.used_memory()),
+        "memory_total_gb": gib(sys.total_memory()),
+        "top_by_cpu": top,
     })
 }
 
-/// One-shot PowerShell query, trimmed stdout (None on failure or no output).
+/// Mounted disks with usage, biggest first (sub-GB volumes trimmed as noise).
+pub fn storage() -> serde_json::Value {
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let mut list: Vec<serde_json::Value> = disks
+        .list()
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "mount": d.mount_point().to_string_lossy(),
+                "total_gb": gib(d.total_space()),
+                "free_gb": gib(d.available_space()),
+            })
+        })
+        .filter(|v| v["total_gb"].as_f64().unwrap_or(0.0) >= 1.0)
+        .collect();
+    list.sort_by(|a, b| {
+        b["total_gb"]
+            .as_f64()
+            .unwrap_or(0.0)
+            .partial_cmp(&a["total_gb"].as_f64().unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    list.truncate(5);
+    serde_json::json!({ "disks": list })
+}
+
+/// Network status: online (the tool call itself arrives over the wire), local
+/// IP, and Wi-Fi SSID/signal where the OS discloses them.
+pub fn network_status() -> serde_json::Value {
+    let mut v = serde_json::json!({ "online": true });
+    if let Some(ip) = local_ip() {
+        v["ip"] = serde_json::json!(ip);
+    }
+    if let Some((ssid, signal)) = wifi() {
+        let mut w = serde_json::json!({ "connected": true });
+        if let Some(ssid) = ssid {
+            w["ssid"] = serde_json::json!(ssid);
+        }
+        if let Some(signal) = signal {
+            w["signal"] = serde_json::json!(signal);
+        }
+        v["wifi"] = w;
+    }
+    v
+}
+
+/// (ssid, signal %) of the associated Wi-Fi network. `ssid` is None when the
+/// OS withholds the name — macOS redacts it as `<redacted>` without Location
+/// permission, which we report as connected-without-name. None overall when
+/// there is no Wi-Fi association (ethernet / no adapter).
+#[cfg(target_os = "macos")]
+fn wifi() -> Option<(Option<String>, Option<u8>)> {
+    for iface in ["en0", "en1", "en2"] {
+        let out = std::process::Command::new("ipconfig")
+            .args(["getsummary", iface])
+            .output();
+        let Ok(out) = out else { continue };
+        if !out.status.success() {
+            continue;
+        }
+        if let Some(ssid) = parse_ssid_field(&String::from_utf8_lossy(&out.stdout)) {
+            return Some(((ssid != "<redacted>").then_some(ssid), None));
+        }
+    }
+    None
+}
+
 #[cfg(windows)]
-fn powershell(script: &str) -> Option<String> {
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", script])
+fn wifi() -> Option<(Option<String>, Option<u8>)> {
+    let out = std::process::Command::new("netsh")
+        .args(["wlan", "show", "interfaces"])
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!s.is_empty()).then_some(s)
-}
-
-/// WMI path: laptop internal panels usually don't speak DDC/CI but do expose
-/// WmiMonitorBrightness (root/wmi), reported as 0..=100.
-#[cfg(windows)]
-fn win_wmi_get() -> Option<f32> {
-    let s = powershell(
-        "(Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightness \
-         | Select-Object -First 1).CurrentBrightness",
-    )?;
-    s.parse::<f32>()
-        .ok()
-        .map(|v| (v / 100.0).clamp(0.0, 1.0))
-}
-
-#[cfg(windows)]
-fn win_wmi_set(v: f32) -> bool {
-    let pct = (v * 100.0).round().clamp(0.0, 100.0);
-    powershell(&format!(
-        "(Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightnessMethods \
-         | Select-Object -First 1).WmiSetBrightness(0, {pct})"
-    ))
-    .is_some()
-}
-
-/// DDC/CI first (external monitors), WMI second (laptop panels).
-#[cfg(windows)]
-pub fn get_brightness() -> Option<f32> {
-    win_ddc_get()
-        .or_else(win_wmi_get)
-        .filter(|v| (0.0..=1.0).contains(v))
-}
-
-#[cfg(windows)]
-pub fn set_brightness(v: f32) -> bool {
-    win_ddc_set(v) || win_wmi_set(v)
-}
-
-// ---- Linux/BSD: kernel backlight + GNOME power-daemon fallback ----
-
-/// First usable backlight device, e.g. /sys/class/backlight/intel_backlight.
-#[cfg(all(unix, not(target_os = "macos")))]
-fn backlight_device() -> Option<std::path::PathBuf> {
-    std::fs::read_dir("/sys/class/backlight")
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.join("max_brightness").exists() && p.join("brightness").exists())
+    let text = String::from_utf8_lossy(&out.stdout);
+    let ssid = parse_ssid_field(&text);
+    let signal = parse_signal_field(&text);
+    (ssid.is_some() || signal.is_some()).then_some((ssid, signal))
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn backlight_read_u32(path: &std::path::Path) -> Option<u32> {
-    std::fs::read_to_string(path)
-        .ok()?
-        .trim()
-        .parse::<u32>()
-        .ok()
-}
-
-/// Kernel backlight level, 0..=1. Reads are world-readable, so this always
-/// answers when a backlight device exists.
-#[cfg(all(unix, not(target_os = "macos")))]
-pub fn get_brightness() -> Option<f32> {
-    let dev = backlight_device()?;
-    let max = backlight_read_u32(&dev.join("max_brightness"))?.max(1);
-    let cur = backlight_read_u32(&dev.join("brightness"))?;
-    Some((cur as f32 / max as f32).clamp(0.0, 1.0))
-}
-
-/// Writing sysfs needs video-group/root permission; desktop sessions usually
-/// lack it, so fall back to GNOME's power daemon over gdbus.
-#[cfg(all(unix, not(target_os = "macos")))]
-pub fn set_brightness(v: f32) -> bool {
-    let v = v.clamp(0.0, 1.0);
-    if let Some(dev) = backlight_device() {
-        let max = backlight_read_u32(&dev.join("max_brightness"))
-            .unwrap_or(255)
-            .max(1);
-        // never write 0 — many panels treat it as "backlight off"
-        let value = (v * max as f32).round().clamp(1.0, max as f32) as u32;
-        if std::fs::write(dev.join("brightness"), value.to_string()).is_ok() {
-            return true;
-        }
-    }
-    let pct = (v * 100.0).round().clamp(0.0, 100.0);
-    std::process::Command::new("gdbus")
-        .args([
-            "call",
-            "--session",
-            "--dest",
-            "org.gnome.SettingsDaemon.Power",
-            "--object-path",
-            "/org/gnome/SettingsDaemon/Power",
-            "--method",
-            "org.gnome.SettingsDaemon.Power.Screen.SetPercentage",
-            &pct.to_string(),
-        ])
+fn wifi() -> Option<(Option<String>, Option<u8>)> {
+    let out = std::process::Command::new("nmcli")
+        .args(["-t", "-f", "ACTIVE,SSID,SIGNAL", "dev", "wifi"])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut parts = line.split(':');
+        if parts.next() != Some("yes") {
+            continue;
+        }
+        let ssid = parts.next().unwrap_or_default();
+        let signal = parts.next().and_then(|s| s.parse::<u8>().ok());
+        return Some(((!ssid.is_empty()).then(|| ssid.to_string()), signal));
+    }
+    None
+}
+
+/// The `SSID : xxx` line of `ipconfig getsummary` / `netsh wlan show
+/// interfaces` output (both keep the SSID label in English). BSSID lines
+/// don't match: they start with 'B'.
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+fn parse_ssid_field(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim_start)
+        .find(|l| l.starts_with("SSID") && l.contains(':'))
+        .map(|l| l.split_once(':').unwrap().1.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The `Signal : 88%` line of netsh output. The label is localized ("信号");
+/// the "NN%" value tail is not.
+#[cfg(any(target_os = "windows", test))]
+fn parse_signal_field(text: &str) -> Option<u8> {
+    text.lines().find_map(|l| {
+        let (_, pct) = l.split_once(':')?;
+        let pct = pct.trim().strip_suffix('%')?;
+        pct.parse::<u8>().ok().map(|v| v.min(100))
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn brightness_roundtrip() {
-        let Some(orig) = super::get_brightness() else {
-            eprintln!("brightness unsupported here; skipping");
-            return;
-        };
-        assert!(super::set_brightness(orig), "set to current value should succeed");
-        let again = super::get_brightness().unwrap();
-        assert!((again - orig).abs() < 0.05, "brightness drifted: {orig} -> {again}");
-    }
-
-    // Read-only on purpose: cargo test must never touch the user's monitor.
-    #[cfg(windows)]
-    #[test]
-    fn brightness_get_is_sane_when_supported() {
-        match super::get_brightness() {
-            Some(v) => assert!((0.0..=1.0).contains(&v), "brightness out of range: {v}"),
-            None => eprintln!("brightness unsupported here (virtual display?); skipping"),
-        }
-    }
-
-    // Same roundtrip as the macOS test above, but opt-in (`cargo test
-    // brightness -- --ignored`) since it performs a real DDC/CI write.
-    #[cfg(windows)]
-    #[test]
-    #[ignore]
-    fn brightness_set_roundtrip_manual() {
-        let Some(orig) = super::get_brightness() else {
-            eprintln!("brightness unsupported here; skipping");
-            return;
-        };
-        assert!(super::set_brightness(orig), "set to current value should succeed");
-    }
-
     #[test]
     fn emotion_index_lookup() {
         assert_eq!(super::super::ui::emotion_index("happy"), 1);
@@ -556,5 +373,54 @@ mod tests {
             assert!(v.get(key).is_some(), "missing key {key}");
         }
         assert!(v["memory_total_gb"].as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn ssid_field_parses_netsh_and_ipconfig_shapes() {
+        let netsh = "    名称                   : WLAN\n    \
+                      SSID                   : MyHome\n    \
+                      BSSID                  : aa:bb:cc:dd:ee:ff\n";
+        assert_eq!(super::parse_ssid_field(netsh).as_deref(), Some("MyHome"));
+        let ipconfig = "uptime = 1234\n SSID : <redacted>\n BSSID : ff:ee:dd\n";
+        assert_eq!(super::parse_ssid_field(ipconfig).as_deref(), Some("<redacted>"));
+        assert_eq!(super::parse_ssid_field("no ssid here"), None);
+        assert_eq!(super::parse_ssid_field(" SSID :\n"), None);
+    }
+
+    #[test]
+    fn signal_field_handles_localized_labels() {
+        let netsh = "    信号                   : 88%\n    \
+                      接收速率 (Mbps)         : 866.7\n";
+        assert_eq!(super::parse_signal_field(netsh), Some(88));
+        assert_eq!(super::parse_signal_field("no percent lines"), None);
+        assert_eq!(super::parse_signal_field("信号                   : 120%"), Some(100));
+    }
+
+    #[test]
+    fn top_processes_is_valid_json() {
+        let v: serde_json::Value = serde_json::from_str(&super::top_processes().to_string())
+            .expect("valid json");
+        assert!(v["cpu_percent"].is_f64());
+        assert!(v["memory_total_gb"].as_f64().unwrap() > 0.0);
+        assert!(v["top_by_cpu"].as_array().unwrap().len() <= 5);
+    }
+
+    #[test]
+    fn storage_is_valid_json() {
+        let v: serde_json::Value =
+            serde_json::from_str(&super::storage().to_string()).expect("valid json");
+        let disks = v["disks"].as_array().expect("disks array");
+        assert!(!disks.is_empty(), "at least one disk");
+        for d in disks {
+            assert!(d["total_gb"].as_f64().unwrap() >= 1.0);
+        }
+    }
+
+    #[test]
+    fn network_status_is_valid_json() {
+        let v: serde_json::Value =
+            serde_json::from_str(&super::network_status().to_string()).expect("valid json");
+        assert_eq!(v["online"], true);
+        assert!(v["ip"].is_string(), "local ip present");
     }
 }

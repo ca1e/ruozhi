@@ -38,8 +38,9 @@ pub enum UiEvent {
     Quit,
 }
 
-/// Requested app action from MCP tools (0 = none, 1 = restart).
+/// Requested app action from MCP tools (0 = none, 1 = restart, 2 = quit).
 pub const ACTION_RESTART: u8 = 1;
+pub const ACTION_QUIT: u8 = 2;
 
 #[derive(Default)]
 pub struct SharedState {

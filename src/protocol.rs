@@ -98,7 +98,7 @@ fn run(
                 }
                 UiEvent::CmdUp => {
                     pressed = false;
-                    on_cmd_up(&mut session, &shared);
+                    on_cmd_up(&mut session, &shared, &audio);
                 }
             }
         }
@@ -106,7 +106,7 @@ fn run(
         // If the button was released before the handshake finished, stop
         // immediately instead of listening open-mouthed.
         if shared.phase() == Phase::Listening && !pressed {
-            on_cmd_up(&mut session, &shared);
+            on_cmd_up(&mut session, &shared, &audio);
         }
 
         // ---- closed: wait for the next press ----
@@ -275,11 +275,11 @@ fn run(
 
         if let Some(reason) = close_reason {
             log::info!("closing session: {reason}");
-            close_session(&mut session, &shared);
+            close_session(&mut session, &shared, &audio);
             draining = false;
         } else if inbound_stale {
             log::warn!("no inbound traffic for 120s, closing");
-            close_session(&mut session, &shared);
+            close_session(&mut session, &shared, &audio);
         }
     }
 }
@@ -293,6 +293,10 @@ fn on_cmd_down(
     decode_rate: &Arc<AtomicU32>,
     audio: &AudioHandles,
 ) {
+    // Capture is on-demand: the first press opens the mic (and is what makes
+    // macOS show its mic permission prompt); on_cmd_up / close_session close
+    // it again after the turn.
+    audio.ensure_capture();
     match shared.phase() {
         Phase::Listening => {}
         // session already open (kept from the last turn) — just start listening
@@ -315,12 +319,12 @@ fn on_cmd_down(
                 Err(e) => {
                     // stale socket: drop it and reconnect from scratch
                     log::warn!("listen start failed: {e:#}; reconnecting");
-                    close_session(session, shared);
-                    start_new_session(session, draining, config, shared, decode_rate);
+                    close_session(session, shared, audio);
+                    start_new_session(session, draining, config, shared, decode_rate, audio);
                 }
             }
         }
-        _ => start_new_session(session, draining, config, shared, decode_rate),
+        _ => start_new_session(session, draining, config, shared, decode_rate, audio),
     }
 }
 
@@ -331,7 +335,10 @@ fn start_new_session(
     config: &Connection,
     shared: &Arc<SharedState>,
     decode_rate: &Arc<AtomicU32>,
+    audio: &AudioHandles,
 ) {
+    // a close-then-reconnect path may have just stopped capture
+    audio.ensure_capture();
     shared.set_phase(Phase::Connecting);
     match open_session(config, decode_rate) {
         Ok(mut s) => {
@@ -344,7 +351,7 @@ fn start_new_session(
                 }
                 Err(e) => {
                     log::warn!("listen start failed: {e:#}");
-                    close_session(session, shared);
+                    close_session(session, shared, audio);
                 }
             }
         }
@@ -356,7 +363,7 @@ fn start_new_session(
 }
 
 /// Command released: stop listening, wait for the reply.
-fn on_cmd_up(session: &mut Option<Session>, shared: &Arc<SharedState>) {
+fn on_cmd_up(session: &mut Option<Session>, shared: &Arc<SharedState>, audio: &AudioHandles) {
     if shared.phase() != Phase::Listening {
         return;
     }
@@ -367,6 +374,7 @@ fn on_cmd_up(session: &mut Option<Session>, shared: &Arc<SharedState>) {
         }
         shared.set_phase(Phase::Waiting);
     }
+    audio.stop_capture();
 }
 
 /// Connect and exchange hellos.
@@ -479,8 +487,9 @@ fn read_until(ws: &mut Ws, deadline: Instant) -> Result<Option<Message>> {
     }
 }
 
-fn close_session(session: &mut Option<Session>, shared: &Arc<SharedState>) {
+fn close_session(session: &mut Option<Session>, shared: &Arc<SharedState>, audio: &AudioHandles) {
     shared.set_mic_enabled(false);
+    audio.stop_capture();
     shared.set_level(0.0);
     shared.set_emotion(0);
     shared.set_phase(Phase::Idle);
@@ -652,15 +661,45 @@ fn handle_mcp(conn: &Connection, shared: &Arc<SharedState>, v: &serde_json::Valu
                     "inputSchema": { "type": "object", "properties": {} }
                 },
                 {
-                    "name": "self.screen.set_brightness",
-                    "description": "Set the screen brightness, ranging from 0 to 100",
+                    "name": "self.system.get_top_processes",
+                    "description": "Shows overall CPU and memory usage plus the processes consuming the most CPU right now",
+                    "inputSchema": { "type": "object", "properties": {} }
+                },
+                {
+                    "name": "self.system.get_storage",
+                    "description": "Lists disk usage: mount point, total and free space per disk, biggest first",
+                    "inputSchema": { "type": "object", "properties": {} }
+                },
+                {
+                    "name": "self.system.get_network_status",
+                    "description": "Reports network status: online, local IP address, and Wi-Fi SSID/signal strength when the OS discloses them",
+                    "inputSchema": { "type": "object", "properties": {} }
+                },
+                {
+                    "name": "self.system.open_app_or_url",
+                    "description": "Opens an application, folder, file or URL (such as a website) on this machine, like double-clicking it",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "brightness": { "type": "number", "description": "Brightness level from 0 to 100" }
+                            "target": { "type": "string", "description": "URL, application name, or file/folder path to open" }
                         },
-                        "required": ["brightness"]
+                        "required": ["target"]
                     }
+                },
+                {
+                    "name": "self.system.lock_screen",
+                    "description": "Locks the screen of this machine (display sleeps and locks under the default password setting)",
+                    "inputSchema": { "type": "object", "properties": {} }
+                },
+                {
+                    "name": "self.app.get_status",
+                    "description": "Reports this app's current state: idle, connecting, listening, waiting or speaking, plus the app version",
+                    "inputSchema": { "type": "object", "properties": {} }
+                },
+                {
+                    "name": "self.exit",
+                    "description": "Quits this application after the current reply finishes playing. Say goodbye to the user first, then call this",
+                    "inputSchema": { "type": "object", "properties": {} }
                 },
                 {
                     "name": "self.reboot",
@@ -706,35 +745,63 @@ fn handle_mcp(conn: &Connection, shared: &Arc<SharedState>, v: &serde_json::Valu
                     if let Some((level, charging)) = crate::hostinfo::battery() {
                         status["battery"] = serde_json::json!({ "level": level, "charging": charging });
                     }
-                    if let Some(b) = crate::hostinfo::get_brightness() {
-                        status["screen"] =
-                            serde_json::json!({ "brightness": (b * 100.0).round() as u32 });
-                    }
                     tool_text(status.to_string())
                 }
-                "self.screen.set_brightness" => {
-                    let b = args.get("brightness").and_then(|b| b.as_f64());
-                    match b {
-                        Some(b) if (0.0..=100.0).contains(&b) => {
-                            if crate::hostinfo::set_brightness((b as f32 / 100.0).clamp(0.05, 1.0)) {
-                                log::info!("brightness set to {}", b as u32);
-                                tool_text(format!("{{\"brightness\": {}}}", b as u32))
-                            } else {
-                                return reply(rpc_error(
-                                    id.clone(),
-                                    -32000,
-                                    "brightness control not available on this display".into(),
-                                ))
-                            }
-                        }
-                        _ => {
-                            return reply(rpc_error(
-                                id.clone(),
-                                -32602,
-                                "invalid params: brightness must be a number from 0 to 100".into(),
-                            ))
-                        }
+                "self.system.get_top_processes" => {
+                    tool_text(crate::hostinfo::top_processes().to_string())
+                }
+                "self.system.get_storage" => tool_text(crate::hostinfo::storage().to_string()),
+                "self.system.get_network_status" => {
+                    tool_text(crate::hostinfo::network_status().to_string())
+                }
+                "self.system.open_app_or_url" => {
+                    let target = args.get("target").and_then(|t| t.as_str()).unwrap_or("").trim();
+                    if target.is_empty() {
+                        return reply(rpc_error(
+                            id.clone(),
+                            -32602,
+                            "invalid params: target must be a non-empty string".into(),
+                        ));
                     }
+                    if crate::actions::open(target) {
+                        log::info!("opened {target:?}");
+                        tool_text(serde_json::json!({ "opened": target }).to_string())
+                    } else {
+                        return reply(rpc_error(
+                            id.clone(),
+                            -32000,
+                            format!("could not open: {target}"),
+                        ));
+                    }
+                }
+                "self.system.lock_screen" => {
+                    if crate::actions::lock_screen() {
+                        log::info!("screen locked");
+                        tool_text("\"locked\"".to_string())
+                    } else {
+                        return reply(rpc_error(
+                            id.clone(),
+                            -32000,
+                            "could not lock the screen".into(),
+                        ));
+                    }
+                }
+                "self.app.get_status" => {
+                    let phase = match shared.phase() {
+                        Phase::Idle => "idle",
+                        Phase::Connecting => "connecting",
+                        Phase::Listening => "listening",
+                        Phase::Waiting => "waiting",
+                        Phase::Speaking => "speaking",
+                    };
+                    tool_text(
+                        serde_json::json!({ "phase": phase, "version": env!("CARGO_PKG_VERSION") })
+                            .to_string(),
+                    )
+                }
+                "self.exit" => {
+                    shared.set_action(crate::state::ACTION_QUIT);
+                    tool_text("\"exiting\"".to_string())
                 }
                 "self.reboot" => {
                     shared.set_action(crate::state::ACTION_RESTART);

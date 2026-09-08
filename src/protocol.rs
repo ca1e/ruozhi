@@ -705,6 +705,26 @@ fn handle_mcp(conn: &Connection, shared: &Arc<SharedState>, v: &serde_json::Valu
                     "name": "self.reboot",
                     "description": "Restart the xiaozhi application",
                     "inputSchema": { "type": "object", "properties": {} }
+                },
+                {
+                    "name": "self.divination.iching",
+                    "description": "Casts the I Ching (Book of Changes) divination: generates six random yao lines, resolves the hexagram in King Wen order, and returns the hexagram text plus the advice for one topic. Use when the user asks for a fortune telling / hexagram divination (占卜、算卦、摇卦)",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "category": {
+                                "type": "string",
+                                "enum": ["运势", "事业", "经商", "求名", "婚恋", "决策"],
+                                "description": "Topic of the question: general fortune, career, business, fame/reputation, love/marriage, or decision making. Ask the user which topic if not clear"
+                            }
+                        },
+                        "required": ["category"]
+                    }
+                },
+                {
+                    "name": "self.divination.liuren",
+                    "description": "Casts the Xiao Liu Ren (Little Six Ren) divination: derives the lunar month, day and double-hour of the current moment and counts them around the six positions to get the omen. Use when the user asks for the quick divination (小六壬、掐指一算)",
+                    "inputSchema": { "type": "object", "properties": {} }
                 }
             ]
         }),
@@ -806,6 +826,45 @@ fn handle_mcp(conn: &Connection, shared: &Arc<SharedState>, v: &serde_json::Valu
                 "self.reboot" => {
                     shared.set_action(crate::state::ACTION_RESTART);
                     tool_text("\"rebooting\"".to_string())
+                }
+                "self.divination.iching" => {
+                    let category = args
+                        .get("category")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    match crate::divination::iching_cast(category) {
+                        Some(v) => {
+                            log::info!("divination: iching [{category}]");
+                            tool_text(v.to_string())
+                        }
+                        None => {
+                            return reply(rpc_error(
+                                id.clone(),
+                                -32602,
+                                format!(
+                                    "invalid params: category must be one of {}",
+                                    crate::divination::CATEGORIES.join("/")
+                                ),
+                            ))
+                        }
+                    }
+                }
+                "self.divination.liuren" => {
+                    match crate::divination::liuren_cast() {
+                        Some(v) => {
+                            log::info!("divination: liuren");
+                            tool_text(v.to_string())
+                        }
+                        None => {
+                            return reply(rpc_error(
+                                id.clone(),
+                                -32000,
+                                "divination failed: cannot convert current date to lunar calendar"
+                                    .into(),
+                            ))
+                        }
+                    }
                 }
                 "self.get_device_info" => {
                     tool_text(crate::hostinfo::json().to_string())

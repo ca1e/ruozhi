@@ -7,6 +7,7 @@
 mod actions;
 mod audio;
 mod config;
+mod divination;
 mod fenster;
 mod hostinfo;
 mod identity;

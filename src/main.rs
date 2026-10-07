@@ -254,7 +254,19 @@ fn run_app(cfg: config::Config, args: &config::Args, source: audio::Source) -> a
             );
         }
 
-        let wait = 1000 / 60 - (fenster::time() - frame_start);
+        // Adaptive frame pace: 60 fps only pays for itself while a state
+        // animation is running. Hidden, the loop just watches the tray icon
+        // and the talk key (30 Hz keeps the press latency imperceptible);
+        // a visible standby orb breathes fine at 20 fps. Cuts wakeups (and
+        // the full-screen pixel work) sharply whenever nothing moves.
+        let frame_ms = if tray::is_hidden() {
+            33
+        } else if shared.phase() == Phase::Idle {
+            50
+        } else {
+            1000 / 60
+        };
+        let wait = frame_ms - (fenster::time() - frame_start);
         if wait > 0 {
             fenster::sleep(wait);
         }

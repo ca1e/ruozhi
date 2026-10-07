@@ -27,8 +27,13 @@ const PROTOCOL_VERSION: u32 = 1;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Connection is dead after this long without any inbound data.
 const INBOUND_TIMEOUT: Duration = Duration::from_secs(120);
-/// Poll granularity while the socket is open (ws read timeout).
+/// Read timeout while the socket is open: caps how long `ws.read()` blocks
+/// when the server sends nothing. Inbound frames always wake the read
+/// immediately, so this is purely an idle-pacing knob: during a talk turn it
+/// must stay short (encoded uplink frames are only flushed between reads),
+/// with a merely-open idle session a long block is free — fewer wakeups.
 const READ_POLL: Duration = Duration::from_millis(50);
+const READ_POLL_IDLE: Duration = Duration::from_millis(500);
 
 type Ws = WebSocket<MaybeTlsStream<TcpStream>>;
 
@@ -79,6 +84,8 @@ fn run(
     let mut last_stat = Instant::now();
     // Set when `tts stop` arrived: drain the audio tail, then disconnect.
     let mut draining = false;
+    // read timeout currently applied to the open socket (adaptive, see below)
+    let mut cur_read_poll = READ_POLL;
 
     loop {
         // ---- UI events, drained no matter the connection state ----
@@ -138,6 +145,14 @@ fn run(
             let Some(s) = session.as_mut() else {
                 unreachable!("session was Some above");
             };
+            // Adaptive read timeout (see READ_POLL): short while a turn is
+            // live (uplink flushes between reads), long while the session
+            // merely idles. Applied only on state flips.
+            let want_poll = if shared.mic_enabled() || draining { READ_POLL } else { READ_POLL_IDLE };
+            if cur_read_poll != want_poll {
+                set_read_poll(&s.ws, want_poll)?;
+                cur_read_poll = want_poll;
+            }
             match s.ws.read() {
             Ok(msg) => {
                 s.last_inbound = Instant::now();
@@ -485,6 +500,16 @@ fn read_until(ws: &mut Ws, deadline: Instant) -> Result<Option<Message>> {
             Err(e) => return Err(e.into()),
         }
     }
+}
+
+/// Applies the adaptive ws read timeout to whichever stream variant is live.
+fn set_read_poll(ws: &Ws, d: Duration) -> Result<()> {
+    match ws.get_ref() {
+        MaybeTlsStream::Plain(s) => s.set_read_timeout(Some(d))?,
+        MaybeTlsStream::NativeTls(t) => t.get_ref().set_read_timeout(Some(d))?,
+        other => bail!("unexpected stream variant {other:?}"),
+    }
+    Ok(())
 }
 
 fn close_session(session: &mut Option<Session>, shared: &Arc<SharedState>, audio: &AudioHandles) {

@@ -103,10 +103,13 @@ impl JitterBuf {
 
 /// Tiny bounded mono f32 ring between cpal callbacks and worker threads.
 /// `level` tracks the buffered sample count (approximate, lock-free reads).
+/// A condvar lets blocking producers (`push_all_blocking`) sleep instead of
+/// spinning; the realtime callback only ever takes the `try_lock` path.
 #[derive(Clone)]
 struct MonoRing {
     q: Arc<Mutex<VecDeque<f32>>>,
     level: Arc<AtomicIsize>,
+    cv: Arc<std::sync::Condvar>,
     cap: usize,
 }
 
@@ -115,6 +118,7 @@ impl MonoRing {
         Self {
             q: Arc::new(Mutex::new(VecDeque::with_capacity(cap))),
             level: Arc::new(AtomicIsize::new(0)),
+            cv: Arc::new(std::sync::Condvar::new()),
             cap,
         }
     }
@@ -139,36 +143,41 @@ impl MonoRing {
         }
     }
 
-    /// Callback: pop one sample, silence when dry.
+    /// Callback: pop one sample, silence when dry. Wakes any producer waiting
+    /// for space (a no-op with no waiter); the notify happens under the lock
+    /// we already hold, so it costs nothing in the common case.
     fn pop(&self) -> Option<f32> {
-        let s = self.q.try_lock().ok().and_then(|mut q| q.pop_front());
+        let mut q = self.q.try_lock().ok()?;
+        let s = q.pop_front();
         if s.is_some() {
             self.level.fetch_sub(1, Ordering::Relaxed);
+            self.cv.notify_all();
         }
         s
     }
 
-    /// Drop everything buffered (barge-in).
+    /// Drop everything buffered (barge-in). Wakes a blocked producer so it
+    /// re-evaluates the freed space instead of sleeping on stale state.
     fn clear(&self) {
         if let Ok(mut q) = self.q.lock() {
             self.level.store(0, Ordering::Relaxed);
             q.clear();
+            self.cv.notify_all();
         }
     }
 
-    /// Worker: blocking push, waits until everything is in the ring.
+    /// Blocking push, sleeps on the condvar until everything is in the ring.
     fn push_all_blocking(&self, samples: &[f32]) {
         let mut pushed = 0;
+        let mut q = self.q.lock().unwrap();
         while pushed < samples.len() {
-            if let Ok(mut q) = self.q.try_lock() {
-                let free = self.cap - q.len();
-                let n = free.min(samples.len() - pushed);
-                q.extend(samples[pushed..pushed + n].iter().copied());
-                self.level.fetch_add(n as isize, Ordering::Relaxed);
-                pushed += n;
-            }
+            let free = self.cap - q.len();
+            let n = free.min(samples.len() - pushed);
+            q.extend(samples[pushed..pushed + n].iter().copied());
+            self.level.fetch_add(n as isize, Ordering::Relaxed);
+            pushed += n;
             if pushed < samples.len() {
-                std::thread::sleep(Duration::from_millis(2));
+                q = self.cv.wait(q).unwrap();
             }
         }
     }
@@ -812,15 +821,24 @@ fn start_capture(
                     if stop.load(Ordering::Relaxed) {
                         return;
                     }
-                    std::thread::sleep(Duration::from_millis(5));
                     raw.clear();
                     cap_ring.drain(&mut raw);
                     if raw.is_empty() {
                         if !shared.mic_enabled() {
                             accum.clear();
+                            // idle: nothing feeds the ring while the capture
+                            // stream is closed — pace at 50 ms (20 wakeups/s)
+                            // instead of 5 ms so the thread stops burning a
+                            // wakeup core between talk turns
+                            std::thread::sleep(Duration::from_millis(50));
+                        } else {
+                            std::thread::sleep(Duration::from_millis(5));
                         }
                         continue;
                     }
+                    // data arrival pace throttles the loop naturally; a short
+                    // nap batches samples instead of draining one at a time
+                    std::thread::sleep(Duration::from_millis(5));
                     resampled.clear();
                     rs.process(&raw, &mut resampled);
                     agc.process(&mut resampled);

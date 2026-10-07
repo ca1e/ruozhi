@@ -164,10 +164,20 @@ fn run_app(cfg: config::Config, args: &config::Args, source: audio::Source) -> a
             break;
         }
 
-        // tray menu: "打开窗口" is applied inside poll(); true = "关闭程序"
-        if tray::poll() {
-            let _ = ui_tx.send(state::UiEvent::Quit);
-            break;
+        // tray menu: "打开窗口" is applied inside poll(); Restart = "重启程序",
+        // Quit = "关闭程序"
+        match tray::poll() {
+            tray::TrayCmd::Restart => {
+                log::info!("restart requested from tray menu — restarting");
+                tray::shutdown();
+                f.close();
+                restart_self();
+            }
+            tray::TrayCmd::Quit => {
+                let _ = ui_tx.send(state::UiEvent::Quit);
+                break;
+            }
+            _ => {}
         }
 
         // Esc hides the window into the tray (Linux: still quits).

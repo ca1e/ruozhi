@@ -14,7 +14,7 @@
 use crate::fenster::Fenster;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
-/// Tray-menu command written by the platform backends: 1 = 打开窗口, 2 = 关闭程序.
+/// Tray-menu command written by the platform backends: 1 = 打开窗口, 2 = 关闭程序, 3 = 重启程序.
 static CMD: AtomicI32 = AtomicI32::new(0);
 /// True while the main window is hidden and the app lives in the menu bar.
 static HIDDEN: AtomicBool = AtomicBool::new(false);
@@ -34,10 +34,23 @@ pub fn init(f: &Fenster) {
     imp::init(f.window_handle())
 }
 
+/// Tray-menu command.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TrayCmd {
+    None,
+    /// 打开窗口：applied inside `poll()` (the window is shown directly).
+    #[allow(dead_code)] // backends construct it as CMD = 1, not via this variant
+    Show,
+    /// 重启程序：relaunch the app via the caller.
+    Restart,
+    /// 关闭程序：the caller turns this into the normal graceful-quit path.
+    Quit,
+}
+
 /// Per-frame pump: applies pending tray-menu commands ("打开窗口" is handled
-/// inside; the window is shown directly). Returns true for 关闭程序, which the
-/// caller turns into the normal graceful-quit path (UiEvent::Quit).
-pub fn poll() -> bool {
+/// inside; the window is shown directly). Returns the pending command for
+/// 重启程序 / 关闭程序, which the caller acts on.
+pub fn poll() -> TrayCmd {
     imp::poll()
 }
 
@@ -54,7 +67,7 @@ pub fn shutdown() {
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use super::{CMD, HIDDEN};
+    use super::{CMD, HIDDEN, TrayCmd};
     use std::ffi::{c_char, c_void, CStr};
     use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
@@ -158,6 +171,10 @@ mod imp {
         CMD.store(1, Ordering::Relaxed);
     }
 
+    unsafe extern "C" fn tray_restart(_self: Id, _cmd: Sel, _sender: Id) {
+        CMD.store(3, Ordering::Relaxed);
+    }
+
     unsafe extern "C" fn tray_quit(_self: Id, _cmd: Sel, _sender: Id) {
         CMD.store(2, Ordering::Relaxed);
     }
@@ -185,6 +202,7 @@ mod imp {
         unsafe {
             let c = objc_allocateClassPair(cls(c"NSObject"), c"RuozhiTrayTarget".as_ptr(), 0);
             class_addMethod(c, sel(c"trayShow:"), imp(tray_show), c"v@:@".as_ptr());
+            class_addMethod(c, sel(c"trayRestart:"), imp(tray_restart), c"v@:@".as_ptr());
             class_addMethod(c, sel(c"trayQuit:"), imp(tray_quit), c"v@:@".as_ptr());
             objc_registerClassPair(c);
             send0(send0(c, sel(c"alloc")), sel(c"init"))
@@ -246,15 +264,16 @@ mod imp {
                 nsstring(c""),
             );
             add_item(menu, target, c"打开窗口", c"trayShow:");
+            add_item(menu, target, c"重启程序", c"trayRestart:");
             add_item(menu, target, c"关闭程序", c"trayQuit:");
             send1::<Id, ()>(item, sel(c"setMenu:"), menu); // right-click uses AppKit's own path
             MENU.store(menu, Ordering::Relaxed);
         }
     }
 
-    pub fn poll() -> bool {
-        if apply_cmd() {
-            return true;
+    pub fn poll() -> TrayCmd {
+        if let cmd @ (TrayCmd::Restart | TrayCmd::Quit) = apply_cmd() {
+            return cmd;
         }
 
         // Left-clicks never reach AppKit: fenster_loop dequeues every
@@ -265,22 +284,23 @@ mod imp {
         let was = PREV_LEFT.swap(pressed, Ordering::Relaxed);
         if pressed && !was && cursor_in_status_item() {
             unsafe { pop_up_menu() };
-            if apply_cmd() {
-                return true;
+            if let cmd @ (TrayCmd::Restart | TrayCmd::Quit) = apply_cmd() {
+                return cmd;
             }
         }
-        false
+        TrayCmd::None
     }
 
-    /// Applies a pending menu choice; true means 关闭程序.
-    fn apply_cmd() -> bool {
+    /// Applies a pending menu choice; Restart/Quit are returned to the caller.
+    fn apply_cmd() -> TrayCmd {
         match CMD.swap(0, Ordering::Relaxed) {
             1 => {
                 show();
-                false
+                TrayCmd::None
             }
-            2 => true,
-            _ => false,
+            3 => TrayCmd::Restart,
+            2 => TrayCmd::Quit,
+            _ => TrayCmd::None,
         }
     }
 
@@ -371,7 +391,7 @@ mod imp {
 
 #[cfg(target_os = "windows")]
 mod imp {
-    use super::{CMD, HIDDEN};
+    use super::{CMD, HIDDEN, TrayCmd};
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU32, Ordering};
 
@@ -546,6 +566,7 @@ mod imp {
                 return;
             }
             AppendMenuW(menu, MF_STRING, 1, wide("打开窗口").as_ptr());
+            AppendMenuW(menu, MF_STRING, 3, wide("重启程序").as_ptr());
             AppendMenuW(menu, MF_STRING, 2, wide("关闭程序").as_ptr());
             let mut pt = POINT { x: 0, y: 0 };
             GetCursorPos(&mut pt);
@@ -565,6 +586,7 @@ mod imp {
             DestroyMenu(menu);
             match cmd {
                 1 => CMD.store(1, Ordering::Relaxed), // 打开窗口
+                3 => CMD.store(3, Ordering::Relaxed), // 重启程序
                 2 => CMD.store(2, Ordering::Relaxed), // 关闭程序
                 _ => {}
             }
@@ -582,14 +604,15 @@ mod imp {
         }
     }
 
-    pub fn poll() -> bool {
+    pub fn poll() -> TrayCmd {
         match CMD.swap(0, Ordering::Relaxed) {
             1 => {
                 show();
-                false
+                TrayCmd::None
             }
-            2 => true,
-            _ => false,
+            3 => TrayCmd::Restart,
+            2 => TrayCmd::Quit,
+            _ => TrayCmd::None,
         }
     }
 
@@ -636,8 +659,8 @@ mod imp {
 mod imp {
     // Tray is deferred on Linux: no-ops keep the facade unchanged.
     pub fn init(_wnd: *mut std::ffi::c_void) {}
-    pub fn poll() -> bool {
-        false
+    pub fn poll() -> super::TrayCmd {
+        super::TrayCmd::None
     }
     pub fn show() {}
     pub fn hide() {}
